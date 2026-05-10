@@ -4,15 +4,9 @@ Simple Windows system tray application that listens for Wake‑on‑LAN magic pa
 
 ## Motivation
 
-I have a laptop and a desktop PC side by side, both connected via Wi‑Fi. The laptop runs 24/7 as a general server, and I access it remotely over VPN (WireGuard). I didn't want to keep the desktop always on or sleep, but I couldn't wake it remotely because it had no Ethernet connection — only Wi‑Fi.
+I have a laptop and a desktop PC side by side, both connected via Wi‑Fi. The laptop runs 24/7 as a general server, and I access it remotely over VPN (WireGuard). I didn't want to keep the desktop always on or sleep, but I couldn't wake it remotely because it had no Ethernet connection.
 
 So I connected the two machines with a simple Ethernet cable. The laptop runs this app, which listens for WoL packets arriving via VPN. When it catches one, it relays it over the Ethernet cable to wake up the desktop. Now I can connect to the VPN, send a WoL packet to the laptop, and the desktop powers on. I can then use Moonlight, RDC or whatever I need.
-
-```mermaid
-graph LR
-    Remote[Remote device<br/>via VPN] -->|WoL packet| Laptop[Laptop<br/>WOL Proxy<br/>listening magic packets]
-    Laptop -->|Ethernet relay| Desktop[Desktop<br/>wakes up]
-```
 
 ## Requirements
 
@@ -25,7 +19,7 @@ graph LR
 
 1. The app captures WoL packets sent to your trigger MAC address.
 2. It automatically resends them to a second MAC address (the relay target).
-3. Packets can arrive on any interface – Wi‑Fi, Ethernet, or VPN – thanks to Npcap.
+3. Packets can arrive on any interface – Wi‑Fi, Ethernet, or VPN.
 
 ## Usage
 
