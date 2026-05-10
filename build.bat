@@ -3,7 +3,7 @@ pip install -r requirements.txt
 if exist "C:\Windows\System32\drivers\npcap.sys" (
     echo Npcap bulundu.
 ) else (
-    echo Lutfen Npcap'i https://npcap.com adresinden indirip kurun.
+    echo Please download and install Npcap from https://npcap.com
     pause
     exit /b
 )
