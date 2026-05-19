@@ -1,7 +1,7 @@
 @echo off
 pip install -r requirements.txt
 if exist "C:\Windows\System32\drivers\npcap.sys" (
-    echo Npcap bulundu.
+    echo Npcap found.
 ) else (
     echo Please download and install Npcap from https://npcap.com
     pause

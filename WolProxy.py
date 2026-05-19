@@ -13,7 +13,9 @@ import winreg
 import ctypes
 import collections
 import re
+from pathlib import Path
 import tkinter as tk
+import tkinter.font as tkf
 from tkinter import scrolledtext, messagebox
 from scapy.all import sniff, Raw, IP
 import pystray
@@ -46,8 +48,6 @@ def _load_ico_image(size: int = 64):
 def _set_window_icon(win: tk.Toplevel):
     try:
         img = _load_ico_image(32)
-        if img is None:
-            return
         tk_img = ImageTk.PhotoImage(img)
         win.iconphoto(True, tk_img)
         win._icon_ref = tk_img
@@ -79,15 +79,16 @@ DEFAULTS = {
 # ─────────────────────────────────────────
 #  SINGLE INSTANCE (mutex)
 # ─────────────────────────────────────────
-_MUTEX_NAME   = "Global\\WOLProxy_SingleInstance"
-_mutex_handle = None
+_MUTEX_NAME        = "Global\\WOLProxy_SingleInstance"
+_mutex_handle      = None
+ERROR_ALREADY_EXISTS = 183   # Win32 — CreateMutex returned handle to existing mutex
 
 def _acquire_mutex() -> bool:
     global _mutex_handle
     try:
         _mutex_handle = ctypes.windll.kernel32.CreateMutexW(None, True, _MUTEX_NAME)
         err = ctypes.windll.kernel32.GetLastError()
-        if err == 183:
+        if err == ERROR_ALREADY_EXISTS:
             return False
         if err != 0:
             return False
@@ -126,7 +127,7 @@ def load_config() -> dict:
             for key in DEFAULTS:
                 try:
                     val, _ = winreg.QueryValueEx(k, key)
-                    result[key] = float(val) if key == "window" else val
+                    result[key] = float(val.replace(",", ".")) if key == "window" else val
                 except FileNotFoundError:
                     pass
     except FileNotFoundError:
@@ -147,7 +148,7 @@ cfg       = load_config()
 _cfg_lock = threading.Lock()
 
 # ─────────────────────────────────────────
-#  SNIFF STATUS  (FIX #3 — dynamic log label)
+#  SNIFF STATUS  (dynamic log label)
 # ─────────────────────────────────────────
 _sniff_status_text = "● listening"
 _sniff_status_ok   = True
@@ -163,15 +164,11 @@ def _set_sniff_status(text: str, ok: bool = True):
 # ─────────────────────────────────────────
 #  WOL CORE (Scapy + Npcap)
 # ─────────────────────────────────────────
-_last_evt      = 0.0
-_last_evt_lock = threading.Lock()
+_last_pkt      = {}           # per-MAC debounce for all WoL events
+_last_pkt_lock = threading.Lock()
 _sniff_stop    = threading.Event()
 _sniff_exited  = threading.Event()
 _restart_lock  = threading.Lock()
-
-def _get_cfg(key):
-    with _cfg_lock:
-        return cfg[key]
 
 def _send_wol():
     try:
@@ -191,7 +188,6 @@ def _send_wol():
         _update_tray_tooltip("WOL Proxy — Send error!")
 
 def _check_wol(pkt):
-    global _last_evt
     if _sniff_stop.is_set():
         return
     try:
@@ -204,14 +200,19 @@ def _check_wol(pkt):
                 return
             target = ":".join(f"{b:02x}" for b in mac_bytes)
             now    = time.time()
-            window = _get_cfg("window")
-            with _last_evt_lock:
-                if now - _last_evt < window:
+            with _cfg_lock:
+                window      = max(0.05, cfg["window"])
+                trigger_mac = cfg["trigger_mac"].lower().replace("-", ":")
+            with _last_pkt_lock:
+                if now - _last_pkt.get(target, 0.0) < window:
                     return
-                _last_evt = now
-            trigger_mac = _get_cfg("trigger_mac").lower().replace("-", ":")
-            target_mac  = _get_cfg("target_mac").lower().replace("-", ":")
-            if target in (trigger_mac, target_mac):
+                _last_pkt[target] = now
+                # Remove stale entries older than 2x the debounce window
+                cutoff = now - window * 2
+                stale  = [k for k, t in _last_pkt.items() if t < cutoff]
+                for k in stale:
+                    del _last_pkt[k]
+            if target == trigger_mac:
                 logging.info(f"[WOL] Captured: {pkt[IP].src} → {target}")
                 threading.Thread(target=_send_wol, daemon=True).start()
             else:
@@ -227,7 +228,6 @@ def _check_npcap() -> bool:
         return False
 
 def _sniff_worker():
-    _sniff_exited.clear()
     if not _check_npcap():
         logging.error("[ERR] Npcap not found — install from https://npcap.com")
         _update_tray_tooltip("WOL Proxy — Npcap missing!")
@@ -240,29 +240,28 @@ def _sniff_worker():
             "WOL Proxy — Npcap Required",
             0x10,
         )
+        _sniff_exited.set()
         return
     logging.info("[INF] Listening on all interfaces...")
     _update_tray_tooltip("WOL Proxy — Listening")
-    # FIX #3 — reflect OK status in log window label
     _set_sniff_status("● listening", ok=True)
     consecutive_errors = 0
     while not _sniff_stop.is_set():
         try:
-            sniff(filter="udp and (port 9 or port 7)",
+            sniff(filter="udp dst port 9",
                   prn=_check_wol, store=0,
                   timeout=5, stop_filter=lambda _: _sniff_stop.is_set())
             consecutive_errors = 0
-            # Restore OK status after recovery
             _set_sniff_status("● listening", ok=True)
         except Exception as e:
             consecutive_errors += 1
-            wait = min(3 * (2 ** min(consecutive_errors - 1, 5)), 120)
+            wait = min(3 * (2 ** min(consecutive_errors - 1, 6)), 120)
             logging.error(f"[ERR] Sniff loop error: {e} — retrying in {wait}s")
             _update_tray_tooltip("WOL Proxy — Sniff error, retrying...")
             _set_sniff_status("● error, retrying…", ok=False)
             if consecutive_errors >= 10:
                 logging.warning("[WRN] Too many sniff errors")
-            time.sleep(wait)
+            _sniff_stop.wait(timeout=wait)
     _sniff_exited.set()
 
 _tray_icon_ref      = None
@@ -298,9 +297,10 @@ def restart_sniff():
 # ─────────────────────────────────────────
 def _exe_cmd():
     if getattr(sys, "frozen", False):
-        return '"' + sys.executable + '"'
-    exe = sys.executable.replace("python.exe", "pythonw.exe")
-    return '"' + exe + '" "' + os.path.abspath(__file__) + '"'
+        return f'"{sys.executable}"'
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    exe = str(pythonw) if pythonw.exists() else sys.executable
+    return f'"{exe}" "{os.path.abspath(__file__)}"'
 
 def startup_enabled():
     try:
@@ -327,6 +327,9 @@ def set_startup(enable: bool):
     except Exception as e:
         logging.error(f"[ERR] Registry startup: {e}")
 
+_LOG_TAGS = {"[OK]": "ok", "[WOL]": "wol", "[BLK]": "blk",
+             "[ERR]": "err", "[WRN]": "wrn"}
+
 # ─────────────────────────────────────────
 #  VALIDATION
 # ─────────────────────────────────────────
@@ -345,7 +348,11 @@ def _valid_ip(v):
 
 def _valid_win(v):
     try:
-        return 0.0 <= float(v) <= 10.0
+        f = float(v.replace(",", "."))
+        if f < 0 or f > 10.0:
+            return False
+        # Must be a multiple of 0.1 (tolerance-based comparison)
+        return abs(f * 10 - round(f * 10)) < 1e-9
     except ValueError:
         return False
 
@@ -377,8 +384,6 @@ class App:
     def _run_tray(self):
         global _tray_icon_ref
         icon_image = _load_ico_image(64)
-        if icon_image is None:
-            return
         menu = pystray.Menu(
             pystray.MenuItem("Show Logs", self._tray_show_logs, default=True),
             pystray.MenuItem("Settings", self._tray_show_settings),
@@ -400,7 +405,9 @@ class App:
         set_startup(not is_enabled)
         state = "enabled" if not is_enabled else "disabled"
         logging.info(f"[INF] Startup {state}")
-        self._set_tray_tooltip_timed(f"WOL Proxy — Startup {state}", "WOL Proxy — Listening", 3.0)
+        with _sniff_status_lock:
+            revert = "WOL Proxy — Listening" if _sniff_status_ok else "WOL Proxy — Error"
+        self._set_tray_tooltip_timed(f"WOL Proxy — Startup {state}", revert, 3.0)
 
     def _set_tray_tooltip_timed(self, text, revert_to, delay):
         if self._tooltip_timer:
@@ -442,6 +449,7 @@ class App:
 
         with _cfg_lock:
             self._orig_cfg = dict(cfg)
+            current = self._orig_cfg
 
         bar = tk.Frame(win, bg="#161b22", height=64)
         bar.pack(fill=tk.X)
@@ -459,8 +467,6 @@ class App:
             ("Broadcast Address", "broadcast"),
             ("Debounce (sec)",    "window"),
         ]
-        with _cfg_lock:
-            current = dict(cfg)
 
         for row, (label, key) in enumerate(fields):
             tk.Label(form, text=label, bg="#0d1117", fg="#c9d1d9",
@@ -473,7 +479,8 @@ class App:
                      font=("Consolas", 10), width=22,
                      highlightthickness=1, highlightbackground="#30363d",
                      highlightcolor="#58a6ff").grid(
-                row=row * 2, column=1, rowspan=2, sticky="new", pady=(10, 10), ipady=5)
+                row=row * 2, column=1, rowspan=2,
+                sticky="new", pady=(10, 10), ipady=5)
 
         form.columnconfigure(1, weight=1)
         tk.Frame(win, bg="#30363d", height=1).pack(fill=tk.X, padx=24)
@@ -498,9 +505,9 @@ class App:
                         new_cfg[key] = val
                 elif key == "window":
                     if not _valid_win(val):
-                        errors.append("Debounce must be 0–10 seconds")
+                        errors.append("Debounce must be 0–10, in steps of 0.1 (e.g. 0, 0.1, 0.5, 1.0)")
                     else:
-                        new_cfg[key] = float(val)
+                        new_cfg[key] = float(val.replace(",", "."))
             if errors:
                 messagebox.showerror("Error", "\n".join(errors), parent=win)
                 return
@@ -610,8 +617,7 @@ class App:
         parts = msg.split("  ", 1)
         ts, body = (parts[0], parts[1]) if len(parts) == 2 else ("", msg)
         tag = "inf"
-        for key, val in {"[OK]": "ok", "[WOL]": "wol", "[BLK]": "blk",
-                         "[ERR]": "err", "[WRN]": "wrn"}.items():
+        for key, val in _LOG_TAGS.items():
             if key in body:
                 tag = val
                 break
@@ -625,7 +631,7 @@ class App:
         self._insert_line(msg)
         line_count = int(self.log_text.index("end-1c").split(".")[0])
         if line_count > LOG_BUFFER:
-            self.log_text.delete("1.0", f"{line_count - LOG_BUFFER}.0")
+            self.log_text.delete("1.0", f"{line_count - LOG_BUFFER + 1}.0")
         self.log_text.configure(state="disabled")
         self.log_text.see(tk.END)
 
@@ -645,7 +651,7 @@ class App:
         except queue.Empty:
             pass
         
-        if self._status_var and self._status_label:
+        if self._status_var and self._status_label and self._text_ok():
             with _sniff_status_lock:
                 txt = _sniff_status_text
                 ok  = _sniff_status_ok
@@ -663,6 +669,12 @@ class App:
         with _buf_lock:
             log_buffer.clear()
             log_buffer.append(sep)
+        # Also drain pending messages from the queue
+        while True:
+            try:
+                log_queue.get_nowait()
+            except queue.Empty:
+                break
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", tk.END)
         self.log_text.insert(tk.END, sep + "\n", "sep")
@@ -707,7 +719,6 @@ def _font_exists(name):
     if name in _font_cache:
         return _font_cache[name]
     try:
-        import tkinter.font as tkf
         result = name in tkf.families()
     except Exception:
         result = False
